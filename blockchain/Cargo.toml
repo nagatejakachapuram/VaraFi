@@ -1,0 +1,31 @@
+# Cargo.toml (root)
+
+[workspace]
+members = ["client"]
+
+
+[package]
+name = "blockchain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blockchain-app = { path = "app" }
+# THESE ARE THE NEW PROBLEM LINES - they were not here in your previous root Cargo.toml
+# You need to disable default features for them here as well
+parity-scale-codec = { version = "3.6", default-features = false, features = ["derive", "max-encoded-len"] } # Disable std
+scale-info = { version = "2.10", default-features = false, features = ["derive"] } # Disable std
+
+[build-dependencies]
+blockchain-app = { path = "app" }
+sails-rs = { version = "0.8.1", features = ["wasm-builder"] }
+sails-idl-gen = "0.8.1"
+
+[dev-dependencies]
+blockchain = { path = ".", features = ["wasm-binary"] }
+blockchain-client = { path = "client" }
+sails-rs = { version = "0.8.1", features = ["gtest"] } # Keep default features for gtest if it relies on std for testing runner
+tokio = { version = "1.41", features = ["rt", "macros"] }
+
+[features]
+wasm-binary = []
