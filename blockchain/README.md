@@ -37,3 +37,9 @@ tokio = { version = "1.41", features = ["rt", "macros"] }
 
 [features]
 wasm-binary = []
+
+
+# THESE ARE THE NEW PROBLEM LINES - they were not here in your previous root Cargo.toml
+# You need to disable default features for them here as well
+# parity-scale-codec = { version = "3.6", default-features = false, features = ["derive", "max-encoded-len"] } # Disable std
+# scale-info = { version = "2.10", default-features = false, features = ["derive"] } # Disable std

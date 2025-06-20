@@ -498,10 +498,8 @@ dependencies = [
  "blockchain",
  "blockchain-app",
  "blockchain-client",
- "parity-scale-codec",
  "sails-idl-gen",
  "sails-rs",
- "scale-info",
  "tokio",
 ]
 

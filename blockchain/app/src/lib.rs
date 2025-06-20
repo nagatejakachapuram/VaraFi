@@ -1,4 +1,5 @@
 #![no_std]
+use sails_rs::prelude::*;
 extern crate alloc;
 // use core::result::Result;
 // #[allow(unused_imports)]
@@ -9,6 +10,7 @@ use sails_rs::{service, program};
 use sails_rs::prelude::ActorId;
 // use sails_rs::types::AccountId;
 
+use core::marker::Sized;
 // Event data structs
 #[derive(Encode, TypeInfo, Clone)]
 pub struct CollateralDeposited { pub user: ActorId, pub amount: u128 }
