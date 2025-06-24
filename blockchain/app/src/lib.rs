@@ -4,6 +4,10 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use sails_rs::{service, program};
 use sails_rs::prelude::ActorId;
+pub mod vft_service; // Rename the module to snake_case
+use crate::vft_service::VftService; // Now import the actual type
+
+
 
 #[derive(Encode, TypeInfo, Clone)]
 pub struct CollateralDeposited { pub user: ActorId, pub amount: u128 }
@@ -23,6 +27,7 @@ pub enum LendingEvent {
 }
 
 pub struct LendingService {
+    vft: VftService,
     collateral: BTreeMap<ActorId, u128>,
     debt: BTreeMap<ActorId, u128>,
     lender_balances: BTreeMap<ActorId, u128>,
@@ -35,6 +40,7 @@ pub struct LendingService {
 impl LendingService {
     pub fn new() -> Self {
         Self {
+            vft: VftService::new(),
             collateral: BTreeMap::new(),
             debt: BTreeMap::new(),
             lender_balances: BTreeMap::new(),
@@ -43,6 +49,7 @@ impl LendingService {
             reentrancy: false,
         }
     }
+    
 
     fn guard<F, R>(&mut self, f: F) -> R
     where F: FnOnce(&mut Self) -> R {
@@ -62,7 +69,7 @@ impl LendingService {
         });
     }
 
-    pub fn borrow(&mut self, user: ActorId, amount: u128) {
+     pub fn borrow(&mut self, user: ActorId, amount: u128) -> CommandReply<()> {
         self.guard(|s| {
             assert!(amount > 0, "Borrow > 0");
             let col = *s.collateral.get(&user).unwrap_or(&0);
@@ -72,19 +79,27 @@ impl LendingService {
             assert!(amount <= s.total_liquidity, "Not enough liquidity");
             *s.debt.entry(user).or_default() += amount;
             s.total_liquidity -= amount;
-           let _ =  s.emit_event(LendingEvent::Borrowed(Borrowed { user, amount }));
-        });
+
+            // return native tokens to borrower
+            let mut reply = CommandReply::new(());
+            reply = reply.with_value(amount);
+            let _ = s.emit_event(LendingEvent::Borrowed(Borrowed { user, amount }));
+            reply
+        })
     }
 
-    pub fn repay(&mut self, user: ActorId, amount: u128) {
+    pub fn repay(&mut self, user: ActorId, amount: u128) -> CommandReply<()> {
         self.guard(|s| {
             let debt = s.debt.entry(user).or_default();
             assert!(*debt > 0, "No debt");
             let paid = amount.min(*debt);
             *debt -= paid;
             s.total_liquidity += paid;
-           let _ = s.emit_event(LendingEvent::Repaid(Repaid { user, amount: paid }));
-        });
+            let mut reply = CommandReply::new(());
+            reply = reply.with_value(paid);
+            let _ = s.emit_event(LendingEvent::Repaid(Repaid { user, amount: paid }));
+            reply
+        })
     }
 
     pub fn lend(&mut self, lender: ActorId, amount: u128) {
@@ -92,17 +107,23 @@ impl LendingService {
             assert!(amount > 0, "Lend > 0");
             *s.lender_balances.entry(lender).or_default() += amount;
             s.total_liquidity += amount;
+            s.vft.mint(lender, amount);
         });
     }
 
-    pub fn withdraw(&mut self, lender: ActorId, amount: u128) {
+    pub fn withdraw(&mut self, lender: ActorId, amount: u128) -> CommandReply<()> {
         self.guard(|s| {
             let bal = s.lender_balances.entry(lender).or_default();
             assert!(*bal >= amount, "Insufficient lender balance");
             *bal -= amount;
             s.total_liquidity -= amount;
-        });
+            s.vft.burn(lender, amount);
+            let mut reply = CommandReply::new(());
+            reply = reply.with_value(amount);
+            reply
+        })
     }
+
 
     pub fn liquidate(&mut self, user: ActorId) {
         self.guard(|s| {
@@ -112,7 +133,7 @@ impl LendingService {
             s.collateral.remove(&user);
             s.debt.remove(&user);
             s.total_liquidity += col;
-          let _ =   s.emit_event(LendingEvent::Liquidated(Liquidated { user, collateral_sold: col, debt_cleared: debt }));
+            let _ = s.emit_event(LendingEvent::Liquidated(Liquidated { user, collateral_sold: col, debt_cleared: debt }));
         });
     }
 
@@ -134,5 +155,8 @@ impl BlockchainProgram {
     }
     pub fn lending_service(&self) -> LendingService {
         LendingService::new()
+    }
+    pub fn vft_service(&self) -> VftService {
+        VftService::new()
     }
 }
