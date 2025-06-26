@@ -12,14 +12,18 @@ blockchain-app = { path = "app" }
 
 [build-dependencies]
 blockchain-app = { path = "app" }
-sails-rs = { version = "0.8.1", features = ["wasm-builder"] }
-sails-idl-gen = "0.8.1"
+sails-rs = { version = "0.8.0", features = ["wasm-builder"] }
+sails-idl-gen = "0.8.0"
 
 [dev-dependencies]
 blockchain = { path = ".", features = ["wasm-binary"] }
 blockchain-client = { path = "client" }
-sails-rs = { version = "0.8.1", features = ["gtest"] } # Keep default features for gtest if it relies on std for testing runner
+sails-rs = { version = "0.8.0", features = ["gtest"] } # Keep default features for gtest if it relies on std for testing runner
 tokio = { version = "1.41", features = ["rt", "macros"] }
+
+[workspace.dependencies]
+sails-rs = { version = "=0.8.0", features = ["wasm-builder", "gtest"] }
+extended-vft-client = { git = "https://github.com/gear-foundation/standards/"}
 
 [features]
 wasm-binary = []

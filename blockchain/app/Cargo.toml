@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-sails-rs = "0.8.1"
+sails-rs = "0.8.0"
 parity-scale-codec = { version = "3.6",default-features=false}
 scale-info = { version = "2.10",default-features=false}
+extended-vft-client = { workspace = true }
