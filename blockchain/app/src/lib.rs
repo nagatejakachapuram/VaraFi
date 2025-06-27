@@ -8,8 +8,10 @@ use alloc::collections::BTreeMap;
 use sails_rs::{ service, program };
 use sails_rs::prelude::ActorId;
 use sails_rs::gstd::msg;
+use sails_rs::gstd::exec::block_timestamp;
 
-// Global static storage for state persistence
+const WAD: u128 = 1_000_000_000_000_000_000;
+
 static mut STORAGE: Option<LendingStorage> = None;
 
 #[derive(Clone, Debug)]
@@ -19,9 +21,11 @@ pub struct LendingStorage {
     pub debt: BTreeMap<ActorId, u128>,
     pub lender_balances: BTreeMap<ActorId, u128>,
     pub total_liquidity: u128,
+    pub treasury: u128,
     pub paused: bool,
     pub reentrancy: bool,
     pub admin: ActorId,
+    pub last_accrual_ts: u64,
 }
 
 #[derive(Encode, TypeInfo, Clone)]
@@ -78,12 +82,10 @@ impl LendingService {
         Self(())
     }
 
-    // Get mutable reference to storage
     pub fn get_mut(&mut self) -> &'static mut LendingStorage {
         unsafe { STORAGE.as_mut().expect("Lending protocol is not initialized") }
     }
 
-    // Get immutable reference to storage
     pub fn get(&self) -> &'static LendingStorage {
         unsafe { STORAGE.as_ref().expect("Lending protocol is not initialized") }
     }
@@ -91,7 +93,6 @@ impl LendingService {
 
 #[service(events = LendingEvent)]
 impl LendingService {
-    // Initialize the service
     pub async fn init(vft_address: ActorId) -> Self {
         unsafe {
             STORAGE = Some(LendingStorage {
@@ -100,15 +101,62 @@ impl LendingService {
                 debt: BTreeMap::new(),
                 lender_balances: BTreeMap::new(),
                 total_liquidity: 0,
+                treasury: 0,
                 paused: false,
                 reentrancy: false,
                 admin: msg::source(),
+                last_accrual_ts: block_timestamp(),
             });
         }
         Self(())
     }
 
+    fn utilization_rate(storage: &LendingStorage) -> u128 {
+        let borrowed: u128 = storage.debt.values().sum();
+        let total = storage.total_liquidity + borrowed;
+        if total == 0 {
+            0
+        } else {
+            (borrowed * WAD) / total
+        }
+    }
+
+    fn borrow_rate_per_year(storage: &LendingStorage) -> u128 {
+        let u = Self::utilization_rate(storage);
+        let r0 = (6 * WAD) / 100;
+        let rmax = (10 * WAD) / 100;
+        let u_opt = (8 * WAD) / 10;
+
+        if u <= u_opt {
+            r0 + (u * (rmax - r0)) / u_opt
+        } else {
+            r0 + (u_opt * (rmax - r0)) / u_opt + ((u - u_opt) * (rmax - r0)) / (WAD - u_opt)
+        }
+    }
+
+    fn accrue_interest(&mut self) {
+        let now = block_timestamp();
+        let dt = now - self.get().last_accrual_ts;
+        if dt == 0 {
+            return;
+        }
+        let storage = self.get_mut();
+        storage.last_accrual_ts = now;
+
+        let rate = Self::borrow_rate_per_year(storage);
+        let sec_per_year = 365u128 * 24 * 3600;
+
+        for (_u, debt) in storage.debt.iter_mut() {
+            let interest = (*debt * rate * (dt as u128)) / sec_per_year / WAD;
+            *debt += interest;
+            let fee = (interest * 2) / 100;
+            storage.treasury += fee;
+            storage.total_liquidity += interest - fee;
+        }
+    }
+
     fn guard<F, R>(&mut self, f: F) -> R where F: FnOnce(&mut LendingStorage) -> R {
+        self.accrue_interest();
         let storage = self.get_mut();
         assert!(!storage.paused, "Protocol is paused");
         assert!(!storage.reentrancy, "Reentrant call");
@@ -124,7 +172,6 @@ impl LendingService {
             *storage.collateral.entry(user).or_default() += amount;
         });
 
-        // Emit event after guard to avoid borrowing conflicts
         let _ = self.emit_event(
             LendingEvent::CollateralDeposited(CollateralDeposited {
                 user,
@@ -140,7 +187,6 @@ impl LendingService {
             let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);
             let current_debt = *storage.debt.get(&user).unwrap_or(&0);
 
-            // Calculate maximum borrowable amount (LTV = 66.67%, so collateral * 100 / 150)
             let max_borrowable = (collateral_amount * 100) / 150;
             assert!(current_debt + amount <= max_borrowable, "Exceeds maximum LTV ratio");
             assert!(amount <= storage.total_liquidity, "Insufficient liquidity in pool");
@@ -148,13 +194,11 @@ impl LendingService {
             *storage.debt.entry(user).or_default() += amount;
             storage.total_liquidity -= amount;
 
-            // Return native tokens to borrower
             let mut reply = CommandReply::new(());
             reply = reply.with_value(amount);
             reply
         });
 
-        // Emit event after guard to avoid borrowing conflicts
         let _ = self.emit_event(
             LendingEvent::Borrowed(Borrowed {
                 user,
@@ -179,7 +223,6 @@ impl LendingService {
             (reply, actual_repay_amount)
         });
 
-        // Emit event after guard to avoid borrowing conflicts
         let _ = self.emit_event(
             LendingEvent::Repaid(Repaid {
                 user,
@@ -191,6 +234,7 @@ impl LendingService {
     }
 
     pub async fn lend(&mut self, lender: ActorId, amount: u128) {
+        self.accrue_interest();
         self.guard(|storage| {
             assert!(amount > 0, "Lend amount must be > 0");
             *storage.lender_balances.entry(lender).or_default() += amount;
@@ -212,6 +256,7 @@ impl LendingService {
     }
 
     pub async fn withdraw(&mut self, lender: ActorId, amount: u128) -> CommandReply<()> {
+        self.accrue_interest();
         let vft = self.get().vft_address;
         let burn_call = vft_io::Burn::encode_call(lender, amount.into());
         msg::send_bytes_with_gas_for_reply(vft, burn_call, 5_000_000_000, 0, 0)
@@ -311,7 +356,7 @@ impl LendingService {
         let debt_amount = self.get_debt(user);
 
         if debt_amount == 0 {
-            return u128::MAX; // No debt means perfect health
+            return u128::MAX;
         }
 
         // Health factor = (collateral_value * liquidation_threshold) / debt_value
@@ -324,13 +369,11 @@ pub struct BlockchainProgram(());
 
 #[program]
 impl BlockchainProgram {
-    // Program constructor - this initializes the lending service
     pub async fn new(vft_address: ActorId) -> Self {
         LendingService::init(vft_address).await;
         Self(())
     }
 
-    // Return the lending service instance (not creating new each time)
     pub fn lending_service(&self) -> LendingService {
         LendingService::new()
     }
