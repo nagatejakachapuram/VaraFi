@@ -11,22 +11,25 @@ use sails_rs::gstd::msg;
 use sails_rs::gstd::exec::block_timestamp;
 
 const WAD: u128 = 1_000_000_000_000_000_000;
+const DEFAULT_TVARA_PRICE: u128 = WAD;
 
 static mut STORAGE: Option<LendingStorage> = None;
-
 
 #[derive(Clone, Debug)]
 pub struct LendingStorage {
     pub vft_address: ActorId,
     pub collateral: BTreeMap<ActorId, u128>,
+    pub tvara_price: u128,
     pub debt: BTreeMap<ActorId, u128>,
     pub lender_balances: BTreeMap<ActorId, u128>,
+    pub lender_interest_earned: BTreeMap<ActorId, u128>,
     pub total_liquidity: u128,
     pub treasury: u128,
     pub paused: bool,
     pub reentrancy: bool,
     pub admin: ActorId,
     pub last_accrual_ts: u64,
+    pub total_interest_earned: u128,
 }
 
 #[derive(Encode, TypeInfo, Clone)]
@@ -66,6 +69,15 @@ pub struct LiquidityWithdrawn {
     pub amount: u128,
 }
 
+#[derive(Encode, TypeInfo, Clone)]
+pub struct UserInfo {
+    pub collateral: u128,
+    pub debt: u128,
+    pub lender_balance: u128,
+    pub tvara_price: u128,
+    pub health_factor: u128,
+}
+
 #[derive(Encode, TypeInfo)]
 pub enum LendingEvent {
     CollateralDeposited(CollateralDeposited),
@@ -98,18 +110,62 @@ impl LendingService {
         unsafe {
             STORAGE = Some(LendingStorage {
                 vft_address,
+                tvara_price: DEFAULT_TVARA_PRICE,
                 collateral: BTreeMap::new(),
                 debt: BTreeMap::new(),
                 lender_balances: BTreeMap::new(),
+                lender_interest_earned: BTreeMap::new(),
                 total_liquidity: 0,
                 treasury: 0,
                 paused: false,
                 reentrancy: false,
                 admin: msg::source(),
                 last_accrual_ts: block_timestamp(),
+                total_interest_earned: 0,
             });
         }
         Self(())
+    }
+
+    fn get_price(storage: &LendingStorage) -> u128 {
+        storage.tvara_price
+    }
+
+    pub fn update_tvara_price(&mut self, new_price: u128) {
+        let storage = self.get_mut();
+        assert_eq!(msg::source(), storage.admin, "Only admin can update price");
+        assert!(new_price > 0, "Price must be positive");
+        storage.tvara_price = new_price;
+    }
+
+    pub fn get_user_info(&self, user: ActorId) -> UserInfo {
+        let storage = self.get();
+        let collateral = *storage.collateral.get(&user).unwrap_or(&0);
+        let debt = *storage.debt.get(&user).unwrap_or(&0);
+        let lender_balance = *storage.lender_balances.get(&user).unwrap_or(&0);
+        let price = storage.tvara_price;
+
+        UserInfo {
+            collateral,
+            debt,
+            lender_balance,
+            tvara_price: price,
+            health_factor: if debt > 0 {
+                self.get_health_factor(user)
+            } else {
+                u128::MAX
+            },
+        }
+    }
+
+    pub fn get_user_position(&self, user: ActorId) -> (u128, u128, u128, u128) {
+        let storage = self.get();
+        let collateral = *storage.collateral.get(&user).unwrap_or(&0);
+        let debt = *storage.debt.get(&user).unwrap_or(&0);
+        let price = storage.tvara_price;
+        let collateral_value = if collateral > 0 { (collateral * price) / WAD } else { 0 };
+
+        (collateral, debt, collateral_value, price)
     }
 
     fn utilization_rate(storage: &LendingStorage) -> u128 {
@@ -120,6 +176,10 @@ impl LendingService {
         } else {
             (borrowed * WAD) / total
         }
+    }
+
+    pub fn get_tvara_price(&self) -> u128 {
+        self.get().tvara_price
     }
 
     fn borrow_rate_per_year(storage: &LendingStorage) -> u128 {
@@ -167,100 +227,108 @@ impl LendingService {
         res
     }
 
-    pub fn deposit_collateral(&mut self) {
-        self.guard(|storage| {
-            // Get the amount of native VARA sent with the message
-            let amount = msg::value();
-            assert!(amount > 0, "Must send VARA tokens as collateral");
-
-            // Get the user (message sender)
-            let user = msg::source();
-
-            // Add the VARA amount to user's collateral
-            *storage.collateral.entry(user).or_default() += amount;
-        });
-
-        // Emit event after the guard
-        let user = msg::source();
-        let amount = msg::value();
-
-        let _ = self.emit_event(
-            LendingEvent::CollateralDeposited(CollateralDeposited {
-                user,
-                amount,
-            })
-        );
-    }
-
-    // pub fn borrow(&mut self, user: ActorId, amount: u128) {
-    // // Deposit collateral checked
+    // pub fn deposit_collateral(&mut self) {
     //     self.guard(|storage| {
-    //         assert!(amount > 0, "Borrow amount must be > 0");
+    //         // Get the amount of native VARA sent with the message
+    //         let amount = msg::value();
+    //         assert!(amount > 0, "Must send VARA tokens as collateral");
 
-    //         let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);  // 5
+    //         // Get the user (message sender)
+    //         let user = msg::source();
 
-    //         let current_debt = *storage.debt.get(&user).unwrap_or(&0);   // Already borrowed some amount
+    //         // Add the VARA amount to user's collateral
+    //         *storage.collateral.entry(user).or_default() += amount;
+    //     });
 
-    //         let max_borrowable = (collateral_amount * 100) / 150;     // 66% of collateral_amount
-    //         assert!(current_debt + amount <= max_borrowable, "Exceeds maximum LTV ratio");  // 5 + (500000000000) 5 VARA = 10VARA * 60%
-    //         assert!(amount <= storage.total_liquidity, "Insufficient liquidity in pool");
-
-    //         *storage.debt.entry(user).or_default() += amount;
-    //         storage.total_liquidity -= amount;
-
-    //           // Tranfer VFT_IO ,  1Mock_token = 1 Vara
+    //     // Emit event after the guard
+    //     let user = msg::source();
+    //     let amount = msg::value();
 
     //     let _ = self.emit_event(
-    //         LendingEvent::Borrowed(Borrowed {
+    //         LendingEvent::CollateralDeposited(CollateralDeposited {
     //             user,
     //             amount,
     //         })
     //     );
     // }
 
-    pub async fn borrow(&mut self, user: ActorId) {
-        // First accrue interest and perform checks
+    pub fn deposit_collateral(&mut self) {
+        let amount = msg::value();
+        assert!(amount > 0, "Must send VARA tokens as collateral");
+        let user = msg::source();
+
+        self.guard(|storage| {
+            *storage.collateral.entry(user).or_default() += amount;
+        });
+
+        let _ = self.emit_event(
+            LendingEvent::CollateralDeposited(CollateralDeposited { user, amount })
+        );
+    }
+
+    // pub async fn borrow(&mut self, user: ActorId) {
+    //     let (vft_address, mint_amount) = self.guard(|storage| {
+    //         let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);
+    //         assert!(collateral_amount > 0, "No collateral deposited");
+
+    //         let price = Self::get_price(storage);
+    //         let collateral_value = (collateral_amount * price) / WAD;
+
+    //         let max_borrowable = collateral_value * 100 / 150; // 150% LTV
+    //         let borrow_amount = collateral_value * 66 / 100;   // 66% typical borrow
+
+    //         let current_debt = *storage.debt.get(&user).unwrap_or(&0);
+    //         assert!(
+    //             current_debt + borrow_amount <= max_borrowable,
+    //             "Exceeds maximum LTV ratio"
+    //         );
+    //         assert!(borrow_amount <= storage.total_liquidity, "Insufficient liquidity");
+
+    //         *storage.debt.entry(user).or_default() += borrow_amount;
+    //         storage.total_liquidity -= borrow_amount;
+
+    //         (storage.vft_address, borrow_amount)
+    //     });
+
+    //     let mint_call = vft_io::Mint::encode_call(user, mint_amount.into());
+    //     msg::send_bytes_with_gas_for_reply(vft_address, mint_call, 5_000_000_000, 0, 0)
+    //         .expect("Mint call failed").await
+    //         .expect("Mint failed");
+
+    //     let _ = self.emit_event(LendingEvent::Borrowed(Borrowed {
+    //         user,
+    //         amount: mint_amount,
+    //     }));
+    // }
+
+    pub async fn borrow(&mut self) {
+        let user = msg::source();
         let (vft_address, mint_amount) = self.guard(|storage| {
             let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);
             assert!(collateral_amount > 0, "No collateral deposited");
 
+            let price = Self::get_price(storage);
+            let collateral_value = (collateral_amount * price) / WAD;
+
+            let max_borrowable = (collateral_value * 100) / 150; // 150% LTV cap
+            let borrow_amount = (collateral_value * 66) / 100; // ~66% safe LTV
+
             let current_debt = *storage.debt.get(&user).unwrap_or(&0);
+            assert!(current_debt + borrow_amount <= max_borrowable, "Exceeds maximum LTV ratio");
+            assert!(borrow_amount <= storage.total_liquidity, "Insufficient liquidity");
 
-            // Calculate maximum borrowable amount (66% of collateral)
-            let max_borrowable = (collateral_amount * 100) / 150; // This gives 66.67% of collateral
-
-            // Calculate actual borrow amount (66% of collateral)
-            let borrow_amount = (collateral_amount * 66) / 100; // 66% of collateral
-
-            // Ensure we don't exceed maximum borrowable amount
-            assert!(
-                borrow_amount <= max_borrowable,
-                "Calculated borrow amount exceeds maximum LTV ratio"
-            );
-
-            // Check if user can borrow (considering existing debt)
-            assert!(
-                current_debt + borrow_amount <= max_borrowable,
-                "Exceeds maximum LTV ratio with existing debt"
-            );
-
-            assert!(borrow_amount <= storage.total_liquidity, "Insufficient liquidity in pool");
-
-            // Update storage
+            // Store debt and reduce liquidity in same "value units"
             *storage.debt.entry(user).or_default() += borrow_amount;
             storage.total_liquidity -= borrow_amount;
 
-            // Return VFT address and amount to mint
             (storage.vft_address, borrow_amount)
         });
 
-        // Mint VFT tokens to the user (66% of their collateral)
         let mint_call = vft_io::Mint::encode_call(user, mint_amount.into());
         msg::send_bytes_with_gas_for_reply(vft_address, mint_call, 5_000_000_000, 0, 0)
             .expect("Mint call failed").await
             .expect("Mint failed");
 
-        // Emit event
         let _ = self.emit_event(
             LendingEvent::Borrowed(Borrowed {
                 user,
@@ -321,50 +389,80 @@ impl LendingService {
             let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);
             let debt_amount = *storage.debt.get(&user).unwrap_or(&0);
 
-            assert!(collateral_amount > 0, "No collateral to withdraw");
-            assert!(amount <= collateral_amount, "Insufficient collateral");
+            assert!(collateral_amount >= amount, "Insufficient collateral");
 
-            // Calculate remaining collateral after withdrawal
-            let remaining_collateral = collateral_amount - amount;
-
-            // Check if remaining collateral can support the debt (maintain LTV ratio)
+            let remaining = collateral_amount - amount;
             if debt_amount > 0 {
-                let max_debt_with_remaining = (remaining_collateral * 100) / 150; // 66.67% LTV
+                let price = Self::get_price(storage);
+                let remaining_value = (remaining * price) / WAD;
+                let max_debt_with_remaining = (remaining_value * 100) / 150;
                 assert!(
                     debt_amount <= max_debt_with_remaining,
                     "Withdrawal would exceed LTV ratio"
                 );
             }
 
-            // Update collateral
-            if remaining_collateral == 0 {
+            if remaining == 0 {
                 storage.collateral.remove(&user);
             } else {
-                *storage.collateral.get_mut(&user).unwrap() = remaining_collateral;
+                *storage.collateral.get_mut(&user).unwrap() = remaining;
             }
 
             amount
         });
 
-        // Return collateral to user
         let sent = msg::send(user, (), collateral_to_return);
         assert!(sent.is_ok(), "Collateral withdrawal failed");
+
+        let _ = self.emit_event(
+            LendingEvent::CollateralDeposited(CollateralDeposited {
+                user,
+                amount: 0, // Optional: you might emit a separate event for withdrawal
+            })
+        );
     }
 
-    pub async fn lend(&mut self, lender: ActorId, amount: u128) {
+    // pub async fn lend(&mut self, lender: ActorId, amount: u128) {
+    //     self.accrue_interest();
+
+    //     self.guard(|storage| {
+    //         assert!(amount > 0, "Lend amount must be > 0");
+
+    //         // Check if the message contains the required native token amount
+    //         let msg_value = msg::value();
+    //         assert_eq!(msg_value, amount, "Message value must equal lend amount");
+
+    //         *storage.lender_balances.entry(lender).or_default() += amount;
+    //         storage.total_liquidity += amount;
+    //     });
+
+    //     let vft = self.get().vft_address;
+    //     let mint_call = vft_io::Mint::encode_call(lender, amount.into());
+    //     msg::send_bytes_with_gas_for_reply(vft, mint_call, 5_000_000_000, 0, 0)
+    //         .expect("Mint call failed").await
+    //         .expect("Mint failed");
+
+    //     let _ = self.emit_event(
+    //         LendingEvent::LiquidityProvided(LiquidityProvided {
+    //             lender,
+    //             amount,
+    //         })
+    //     );
+    // }
+
+    pub async fn lend(&mut self) {
+        let lender=msg::source();
         self.accrue_interest();
 
+        let amount = msg::value();
+        assert!(amount > 0, "Lend amount must be > 0");
+
         self.guard(|storage| {
-            assert!(amount > 0, "Lend amount must be > 0");
-
-            // Check if the message contains the required native token amount
-            let msg_value = msg::value();
-            assert_eq!(msg_value, amount, "Message value must equal lend amount");
-
             *storage.lender_balances.entry(lender).or_default() += amount;
             storage.total_liquidity += amount;
         });
 
+        // Mint VFT tokens equivalent to `amount`
         let vft = self.get().vft_address;
         let mint_call = vft_io::Mint::encode_call(lender, amount.into());
         msg::send_bytes_with_gas_for_reply(vft, mint_call, 5_000_000_000, 0, 0)
@@ -379,7 +477,8 @@ impl LendingService {
         );
     }
 
-    pub async fn withdraw(&mut self, lender: ActorId, amount: u128) {
+    pub async fn withdraw(&mut self, amount: u128) {
+        let lender=msg::source();
         self.accrue_interest();
 
         let vft = self.get().vft_address;
@@ -415,13 +514,12 @@ impl LendingService {
             assert!(collateral_amount > 0, "No collateral to liquidate");
             assert!(debt_amount > 0, "No debt to liquidate");
 
-            // Check if position is undercollateralized (LTV > 120%)
-            assert!(
-                (collateral_amount * 100) / debt_amount < 120,
-                "Position is not eligible for liquidation"
-            );
+            let price = Self::get_price(storage);
+            let collateral_value = (collateral_amount * price) / WAD;
 
-            // Remove the position
+            let health = (collateral_value * 100) / debt_amount;
+            assert!(health < 120, "Position not eligible for liquidation");
+
             storage.collateral.remove(&user);
             storage.debt.remove(&user);
             storage.total_liquidity += collateral_amount;
@@ -429,7 +527,6 @@ impl LendingService {
             (collateral_amount, debt_amount)
         });
 
-        // Emit event after guard to avoid borrowing conflicts
         let _ = self.emit_event(
             LendingEvent::Liquidated(Liquidated {
                 user,
