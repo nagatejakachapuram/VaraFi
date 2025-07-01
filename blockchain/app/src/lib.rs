@@ -10,26 +10,30 @@ use sails_rs::prelude::ActorId;
 use sails_rs::gstd::msg;
 use sails_rs::gstd::exec::block_timestamp;
 
-const WAD: u128 = 1_000_000_000_000_000_000;
-const DEFAULT_TVARA_PRICE: u128 = WAD;
+// Fixed decimal constants
+const WAD: u128 = 1_000_000_000_000_000_000; // 18 decimals for calculations
+const TVARA_UNIT: u128 = 1_000_000_000_000; // 12 decimals for TVARA/VFT tokens
+const DEFAULT_TVARA_PRICE: u128 = WAD; // 1 TVARA = 1 USD (in 18 decimal format for calculations)
 
 static mut STORAGE: Option<LendingStorage> = None;
 
 #[derive(Clone, Debug)]
 pub struct LendingStorage {
     pub vft_address: ActorId,
-    pub collateral: BTreeMap<ActorId, u128>,
-    pub tvara_price: u128,
-    pub debt: BTreeMap<ActorId, u128>,
-    pub lender_balances: BTreeMap<ActorId, u128>,
+    pub collateral: BTreeMap<ActorId, u128>, // in TVARA units (12 decimals)
+    pub tvara_price: u128, // in 18 decimal format for calculations
+    pub debt: BTreeMap<ActorId, u128>, // in TVARA units (12 decimals) - simplified!
+    pub lender_balances: BTreeMap<ActorId, u128>, // in TVARA units (12 decimals)
     pub lender_interest_earned: BTreeMap<ActorId, u128>,
-    pub total_liquidity: u128,
-    pub treasury: u128,
+    pub total_liquidity: u128, // in TVARA units (12 decimals)
+    pub treasury: u128, // in TVARA units (12 decimals)
     pub paused: bool,
     pub reentrancy: bool,
     pub admin: ActorId,
     pub last_accrual_ts: u64,
     pub total_interest_earned: u128,
+    // Track accrued interest per user in TVARA units
+    pub user_accrued_interest: BTreeMap<ActorId, u128>, // in TVARA units (12 decimals)
 }
 
 #[derive(Encode, TypeInfo, Clone)]
@@ -122,6 +126,7 @@ impl LendingService {
                 admin: msg::source(),
                 last_accrual_ts: block_timestamp(),
                 total_interest_earned: 0,
+                user_accrued_interest: BTreeMap::new(),
             });
         }
         Self(())
@@ -163,7 +168,8 @@ impl LendingService {
         let collateral = *storage.collateral.get(&user).unwrap_or(&0);
         let debt = *storage.debt.get(&user).unwrap_or(&0);
         let price = storage.tvara_price;
-        let collateral_value = if collateral > 0 { (collateral * price) / WAD } else { 0 };
+        // Convert TVARA collateral to value using price (for 18-decimal calculations)
+        let collateral_value = (collateral * price) / TVARA_UNIT;
 
         (collateral, debt, collateral_value, price)
     }
@@ -174,6 +180,7 @@ impl LendingService {
         if total == 0 {
             0
         } else {
+            // Use WAD for percentage calculations
             (borrowed * WAD) / total
         }
     }
@@ -207,10 +214,15 @@ impl LendingService {
         let rate = Self::borrow_rate_per_year(storage);
         let sec_per_year = 365u128 * 24 * 3600;
 
-        for (_u, debt) in storage.debt.iter_mut() {
+        for (user, debt) in storage.debt.iter_mut() {
+            // Calculate interest in TVARA terms directly
             let interest = (*debt * rate * (dt as u128)) / sec_per_year / WAD;
             *debt += interest;
-            let fee = (interest * 2) / 100;
+            
+            // Track accrued interest per user in TVARA units
+            *storage.user_accrued_interest.entry(*user).or_default() += interest;
+            
+            let fee = (interest * 2) / 100; // 2% fee
             storage.treasury += fee;
             storage.total_liquidity += interest - fee;
         }
@@ -227,31 +239,6 @@ impl LendingService {
         res
     }
 
-    // pub fn deposit_collateral(&mut self) {
-    //     self.guard(|storage| {
-    //         // Get the amount of native VARA sent with the message
-    //         let amount = msg::value();
-    //         assert!(amount > 0, "Must send VARA tokens as collateral");
-
-    //         // Get the user (message sender)
-    //         let user = msg::source();
-
-    //         // Add the VARA amount to user's collateral
-    //         *storage.collateral.entry(user).or_default() += amount;
-    //     });
-
-    //     // Emit event after the guard
-    //     let user = msg::source();
-    //     let amount = msg::value();
-
-    //     let _ = self.emit_event(
-    //         LendingEvent::CollateralDeposited(CollateralDeposited {
-    //             user,
-    //             amount,
-    //         })
-    //     );
-    // }
-
     pub fn deposit_collateral(&mut self) {
         let amount = msg::value();
         assert!(amount > 0, "Must send VARA tokens as collateral");
@@ -266,41 +253,6 @@ impl LendingService {
         );
     }
 
-    // pub async fn borrow(&mut self, user: ActorId) {
-    //     let (vft_address, mint_amount) = self.guard(|storage| {
-    //         let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);
-    //         assert!(collateral_amount > 0, "No collateral deposited");
-
-    //         let price = Self::get_price(storage);
-    //         let collateral_value = (collateral_amount * price) / WAD;
-
-    //         let max_borrowable = collateral_value * 100 / 150; // 150% LTV
-    //         let borrow_amount = collateral_value * 66 / 100;   // 66% typical borrow
-
-    //         let current_debt = *storage.debt.get(&user).unwrap_or(&0);
-    //         assert!(
-    //             current_debt + borrow_amount <= max_borrowable,
-    //             "Exceeds maximum LTV ratio"
-    //         );
-    //         assert!(borrow_amount <= storage.total_liquidity, "Insufficient liquidity");
-
-    //         *storage.debt.entry(user).or_default() += borrow_amount;
-    //         storage.total_liquidity -= borrow_amount;
-
-    //         (storage.vft_address, borrow_amount)
-    //     });
-
-    //     let mint_call = vft_io::Mint::encode_call(user, mint_amount.into());
-    //     msg::send_bytes_with_gas_for_reply(vft_address, mint_call, 5_000_000_000, 0, 0)
-    //         .expect("Mint call failed").await
-    //         .expect("Mint failed");
-
-    //     let _ = self.emit_event(LendingEvent::Borrowed(Borrowed {
-    //         user,
-    //         amount: mint_amount,
-    //     }));
-    // }
-
     pub async fn borrow(&mut self) {
         let user = msg::source();
         let (vft_address, mint_amount) = self.guard(|storage| {
@@ -308,16 +260,22 @@ impl LendingService {
             assert!(collateral_amount > 0, "No collateral deposited");
 
             let price = Self::get_price(storage);
-            let collateral_value = (collateral_amount * price) / WAD;
+            // Convert collateral to value for LTV calculations (18 decimal precision)
+            let collateral_value = (collateral_amount * price) / TVARA_UNIT;
 
-            let max_borrowable = (collateral_value * 100) / 150; // 150% LTV cap
-            let borrow_amount = (collateral_value * 66) / 100; // ~66% safe LTV
+            let max_borrowable_value = (collateral_value * 100) / 150; // 150% LTV cap
+            let borrow_value = (collateral_value * 66) / 100; // ~66% safe LTV
+
+            // Convert borrow value back to TVARA units for debt tracking
+            let borrow_amount = (borrow_value * TVARA_UNIT) / price;
 
             let current_debt = *storage.debt.get(&user).unwrap_or(&0);
+            let max_borrowable = (max_borrowable_value * TVARA_UNIT) / price;
+            
             assert!(current_debt + borrow_amount <= max_borrowable, "Exceeds maximum LTV ratio");
             assert!(borrow_amount <= storage.total_liquidity, "Insufficient liquidity");
 
-            // Store debt and reduce liquidity in same "value units"
+            // Store debt in TVARA units (12 decimals)
             *storage.debt.entry(user).or_default() += borrow_amount;
             storage.total_liquidity -= borrow_amount;
 
@@ -337,6 +295,7 @@ impl LendingService {
         );
     }
 
+    // MAIN CHANGE: Updated repay function to deduct interest from collateral
     pub async fn repay(&mut self, user: ActorId, amount: u128) {
         // First burn the VFT tokens from the user
         let vft_address = self.get().vft_address;
@@ -347,7 +306,7 @@ impl LendingService {
             .expect("VFT burn failed - insufficient VFT balance");
 
         // Then update the storage after successful VFT burn
-        let (actual_repay_amount, collateral_to_return, debt_fully_paid) = self.guard(|storage| {
+        let (actual_repay_amount, collateral_to_return, debt_fully_paid, interest_deducted) = self.guard(|storage| {
             let debt_entry = storage.debt.entry(user).or_default();
             assert!(*debt_entry > 0, "No outstanding debt");
 
@@ -357,19 +316,38 @@ impl LendingService {
 
             // Check if debt is fully paid
             let debt_fully_paid = *debt_entry == 0;
-            let collateral_to_return = if debt_fully_paid {
-                // Return all collateral if debt is fully paid
-                let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);
-                storage.collateral.remove(&user); // Remove collateral entry
-                collateral_amount
-            } else {
-                0 // Don't return collateral if debt still exists
-            };
+            let mut collateral_to_return = 0;
+            let mut interest_deducted = 0;
 
-            (actual_repay_amount, collateral_to_return, debt_fully_paid)
+            if debt_fully_paid {
+                // Get total accrued interest for this user (in TVARA units)
+                let total_accrued_interest = *storage.user_accrued_interest.get(&user).unwrap_or(&0);
+                let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);
+                
+                if collateral_amount > total_accrued_interest {
+                    // Deduct interest from collateral
+                    collateral_to_return = collateral_amount - total_accrued_interest;
+                    interest_deducted = total_accrued_interest;
+                    
+                    // Add deducted interest to treasury
+                    storage.treasury += total_accrued_interest;
+                } else {
+                    // If collateral is less than interest, take all collateral
+                    interest_deducted = collateral_amount;
+                    storage.treasury += collateral_amount;
+                    collateral_to_return = 0;
+                }
+                
+                // Remove user entries
+                storage.collateral.remove(&user);
+                storage.debt.remove(&user);
+                storage.user_accrued_interest.remove(&user);
+            }
+
+            (actual_repay_amount, collateral_to_return, debt_fully_paid, interest_deducted)
         });
 
-        // Return collateral to user if debt is fully paid
+        // Return remaining collateral to user if debt is fully paid
         if debt_fully_paid && collateral_to_return > 0 {
             let sent = msg::send(user, (), collateral_to_return);
             assert!(sent.is_ok(), "Collateral return failed");
@@ -383,7 +361,7 @@ impl LendingService {
         );
     }
 
-    // Additional function for partial collateral withdrawal (optional)
+    // Additional function for partial collateral withdrawal
     pub fn withdraw_collateral(&mut self, user: ActorId, amount: u128) {
         let collateral_to_return = self.guard(|storage| {
             let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);
@@ -394,10 +372,12 @@ impl LendingService {
             let remaining = collateral_amount - amount;
             if debt_amount > 0 {
                 let price = Self::get_price(storage);
-                let remaining_value = (remaining * price) / WAD;
-                let max_debt_with_remaining = (remaining_value * 100) / 150;
+                let remaining_value = (remaining * price) / TVARA_UNIT;
+                let max_debt_value = (remaining_value * 100) / 150;
+                let max_debt = (max_debt_value * TVARA_UNIT) / price;
+                
                 assert!(
-                    debt_amount <= max_debt_with_remaining,
+                    debt_amount <= max_debt,
                     "Withdrawal would exceed LTV ratio"
                 );
             }
@@ -413,45 +393,10 @@ impl LendingService {
 
         let sent = msg::send(user, (), collateral_to_return);
         assert!(sent.is_ok(), "Collateral withdrawal failed");
-
-        let _ = self.emit_event(
-            LendingEvent::CollateralDeposited(CollateralDeposited {
-                user,
-                amount: 0, // Optional: you might emit a separate event for withdrawal
-            })
-        );
     }
 
-    // pub async fn lend(&mut self, lender: ActorId, amount: u128) {
-    //     self.accrue_interest();
-
-    //     self.guard(|storage| {
-    //         assert!(amount > 0, "Lend amount must be > 0");
-
-    //         // Check if the message contains the required native token amount
-    //         let msg_value = msg::value();
-    //         assert_eq!(msg_value, amount, "Message value must equal lend amount");
-
-    //         *storage.lender_balances.entry(lender).or_default() += amount;
-    //         storage.total_liquidity += amount;
-    //     });
-
-    //     let vft = self.get().vft_address;
-    //     let mint_call = vft_io::Mint::encode_call(lender, amount.into());
-    //     msg::send_bytes_with_gas_for_reply(vft, mint_call, 5_000_000_000, 0, 0)
-    //         .expect("Mint call failed").await
-    //         .expect("Mint failed");
-
-    //     let _ = self.emit_event(
-    //         LendingEvent::LiquidityProvided(LiquidityProvided {
-    //             lender,
-    //             amount,
-    //         })
-    //     );
-    // }
-
     pub async fn lend(&mut self) {
-        let lender=msg::source();
+        let lender = msg::source();
         self.accrue_interest();
 
         let amount = msg::value();
@@ -478,7 +423,7 @@ impl LendingService {
     }
 
     pub async fn withdraw(&mut self, amount: u128) {
-        let lender=msg::source();
+        let lender = msg::source();
         self.accrue_interest();
 
         let vft = self.get().vft_address;
@@ -515,13 +460,15 @@ impl LendingService {
             assert!(debt_amount > 0, "No debt to liquidate");
 
             let price = Self::get_price(storage);
-            let collateral_value = (collateral_amount * price) / WAD;
+            let collateral_value = (collateral_amount * price) / TVARA_UNIT;
+            let debt_value = (debt_amount * price) / TVARA_UNIT;
 
-            let health = (collateral_value * 100) / debt_amount;
+            let health = (collateral_value * 100) / debt_value;
             assert!(health < 120, "Position not eligible for liquidation");
 
             storage.collateral.remove(&user);
             storage.debt.remove(&user);
+            storage.user_accrued_interest.remove(&user);
             storage.total_liquidity += collateral_amount;
 
             (collateral_amount, debt_amount)
@@ -583,8 +530,18 @@ impl LendingService {
         }
 
         // Health factor = (collateral_value * liquidation_threshold) / debt_value
+        // Both are in TVARA units, so we can compare directly
         // Using 120% as liquidation threshold
         (collateral_amount * 120) / debt_amount
+    }
+
+    // Helper functions
+    pub fn get_user_accrued_interest(&self, user: ActorId) -> u128 {
+        *self.get().user_accrued_interest.get(&user).unwrap_or(&0)
+    }
+
+    pub fn get_treasury_balance(&self) -> u128 {
+        self.get().treasury
     }
 }
 
