@@ -52,6 +52,9 @@ pub struct Borrowed {
 pub struct Repaid {
     pub user: ActorId,
     pub amount: u128,
+    pub collateral_to_return : u128,
+    pub interest_deducted : u128
+    pub debt_fully_paid : bool
 }
 
 #[derive(Encode, TypeInfo, Clone)]
@@ -203,7 +206,7 @@ impl LendingService {
     }
 
     fn accrue_interest(&mut self) {
-        let now = block_timestamp();
+        let now = block_timestamp();  // current blockTimestamp 
         let dt = now - self.get().last_accrual_ts;
         if dt == 0 {
             return;
@@ -217,7 +220,7 @@ impl LendingService {
         for (user, debt) in storage.debt.iter_mut() {
             // Calculate interest in TVARA terms directly
             let interest = (*debt * rate * (dt as u128)) / sec_per_year / WAD;
-            *debt += interest;
+            // *debt += interest;
             
             // Track accrued interest per user in TVARA units
             *storage.user_accrued_interest.entry(*user).or_default() += interest;
@@ -297,70 +300,64 @@ impl LendingService {
 
     // MAIN CHANGE: Updated repay function to deduct interest from collateral
     pub async fn repay(&mut self, user: ActorId, amount: u128) {
-        // First burn the VFT tokens from the user
         let vft_address = self.get().vft_address;
         let burn_call = vft_io::Burn::encode_call(user, amount.into());
-
+    
         msg::send_bytes_with_gas_for_reply(vft_address, burn_call, 5_000_000_000, 0, 0)
             .expect("Burn call failed").await
             .expect("VFT burn failed - insufficient VFT balance");
-
-        // Then update the storage after successful VFT burn
-        let (actual_repay_amount, collateral_to_return, debt_fully_paid, interest_deducted) = self.guard(|storage| {
+    
+        let (collateral_to_return, debt_fully_paid, interest_deducted) = self.guard(|storage| {
             let debt_entry = storage.debt.entry(user).or_default();
-            assert!(*debt_entry > 0, "No outstanding debt");
-
-            let actual_repay_amount = amount.min(*debt_entry);
-            *debt_entry -= actual_repay_amount;
-            storage.total_liquidity += actual_repay_amount;
-
-            // Check if debt is fully paid
-            let debt_fully_paid = *debt_entry == 0;
+            let accrued_interest = *storage.user_accrued_interest.get(&user).unwrap_or(&0);
+    
+            // Only allow repayment up to the principal
+            assert!(amount <= *debt_entry, "Cannot repay more than principal debt");
+    
+            *debt_entry -= amount;
+            storage.total_liquidity += amount;
+    
             let mut collateral_to_return = 0;
             let mut interest_deducted = 0;
-
+            let debt_fully_paid = *debt_entry == 0;
+    
             if debt_fully_paid {
-                // Get total accrued interest for this user (in TVARA units)
-                let total_accrued_interest = *storage.user_accrued_interest.get(&user).unwrap_or(&0);
                 let collateral_amount = *storage.collateral.get(&user).unwrap_or(&0);
-                
-                if collateral_amount > total_accrued_interest {
-                    // Deduct interest from collateral
-                    collateral_to_return = collateral_amount - total_accrued_interest;
-                    interest_deducted = total_accrued_interest;
-                    
-                    // Add deducted interest to treasury
-                    storage.treasury += total_accrued_interest;
+    
+                if collateral_amount > accrued_interest {
+                    collateral_to_return = collateral_amount - accrued_interest;
+                    interest_deducted = accrued_interest;
+                    storage.treasury += accrued_interest;
                 } else {
-                    // If collateral is less than interest, take all collateral
                     interest_deducted = collateral_amount;
                     storage.treasury += collateral_amount;
                     collateral_to_return = 0;
                 }
-                
-                // Remove user entries
+    
                 storage.collateral.remove(&user);
                 storage.debt.remove(&user);
                 storage.user_accrued_interest.remove(&user);
             }
-
-            (actual_repay_amount, collateral_to_return, debt_fully_paid, interest_deducted)
+    
+            (collateral_to_return, debt_fully_paid, interest_deducted)
         });
-
-        // Return remaining collateral to user if debt is fully paid
+    
         if debt_fully_paid && collateral_to_return > 0 {
             let sent = msg::send(user, (), collateral_to_return);
             assert!(sent.is_ok(), "Collateral return failed");
         }
-
+    
         let _ = self.emit_event(
             LendingEvent::Repaid(Repaid {
                 user,
-                amount: actual_repay_amount,
+                amount,
+                collateral_to_return,
+                interest_deducted, 
+                debt_fully_paid
             })
         );
     }
-
+    
     // Additional function for partial collateral withdrawal
     pub fn withdraw_collateral(&mut self, user: ActorId, amount: u128) {
         let collateral_to_return = self.guard(|storage| {
@@ -434,8 +431,8 @@ impl LendingService {
             .expect("Burn failed");
 
         self.guard(|storage| {
-            let bal = storage.lender_balances.entry(lender).or_default();
-            assert!(*bal >= amount, "Insufficient balance");
+            let bal = storage.lender_balances.entry(lender).or_default();   // lender balance : 10000000000000
+            assert!(*bal >= amount, "Insufficient balance");    // lender balance - amount_total_burn(In this basically, as equivalent amount of token is minted , so user send  )
             *bal -= amount;
             storage.total_liquidity -= amount;
 
