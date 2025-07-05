@@ -25,6 +25,7 @@ pub enum LendingAction {
     ClaimInterest,
     AdminWithdrawFunds(u128),
     AdminWithdrawTreasury(u128),
+    GetContractState,
 }
 
 #[derive(Encode, Decode, TypeInfo, Clone, Debug)]
@@ -41,4 +42,5 @@ pub enum LendingReply {
     UtilizationRate(u128),
     Success,
     Error(String),
+    ContractState(crate::ContractState),
 }

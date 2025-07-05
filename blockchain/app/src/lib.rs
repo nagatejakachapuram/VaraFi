@@ -5,13 +5,10 @@ use extended_vft_client::vft::io as vft_io;
 use sails_rs::prelude::*;
 extern crate alloc;
 use alloc::collections::BTreeMap;
-use alloc::string::String;
-use parity_scale_codec::{Decode, Encode};
 use sails_rs::gstd::exec::block_timestamp;
 use sails_rs::gstd::msg;
 use sails_rs::prelude::ActorId;
 use sails_rs::{program, service}; // Import energy_balance
-use scale_info::TypeInfo;
 
 // Fixed decimal constants
 const WAD: u128 = 1_000_000_000_000_000_000; // 18 decimals for calculations
@@ -25,28 +22,6 @@ const TREASURY_INTEREST_SHARE: u128 = 2; // 2% for treasury
 const TOTAL_INTEREST_SHARE_PERCENT: u128 = LENDER_INTEREST_SHARE + TREASURY_INTEREST_SHARE; // Total 6% from accrued interest
 
 static mut STORAGE: Option<LendingStorage> = None;
-// === State Struct ===
-#[derive(State, Debug)]
-pub struct LendingContract {
-    #[state]
-    pub vft_address: Var<ActorId>,
-}
-
-// === Init Message ===
-#[derive(Encode, Decode, TypeInfo, Clone, Debug)]
-pub struct LendingInit {
-    pub vft_address: ActorId,
-}
-
-// === Contract Impl (Init Handler) ===
-impl Contract for LendingContract {
-    type Message = LendingInit;
-    type Response = ();
-
-    fn handle(&mut self, _ctx: &Context, msg: Self::Message) -> Self::Response {
-        self.vft_address.set(msg.vft_address);
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct LendingStorage {
@@ -155,6 +130,45 @@ impl LendingService {
             STORAGE
                 .as_ref()
                 .expect("Lending protocol is not initialized")
+        }
+    }
+}
+
+#[derive(Clone, Debug, Encode, Decode, TypeInfo)]
+pub struct ContractState {
+    pub vft_address: ActorId,
+    pub collateral: BTreeMap<ActorId, u128>,
+    pub tvara_price: u128,
+    pub debt: BTreeMap<ActorId, u128>,
+    pub lender_balances: BTreeMap<ActorId, u128>,
+    pub lender_interest_earned: BTreeMap<ActorId, u128>,
+    pub total_liquidity: u128,
+    pub treasury: u128,
+    pub paused: bool,
+    pub admin: ActorId,
+    pub last_accrual_ts: u64,
+    pub total_interest_earned: u128,
+    pub user_accrued_interest: BTreeMap<ActorId, u128>,
+    pub total_principal_borrowed: u128,
+}
+
+impl From<&LendingStorage> for ContractState {
+    fn from(storage: &LendingStorage) -> Self {
+        Self {
+            vft_address: storage.vft_address,
+            collateral: storage.collateral.clone(),
+            tvara_price: storage.tvara_price,
+            debt: storage.debt.clone(),
+            lender_balances: storage.lender_balances.clone(),
+            lender_interest_earned: storage.lender_interest_earned.clone(),
+            total_liquidity: storage.total_liquidity,
+            treasury: storage.treasury,
+            paused: storage.paused,
+            admin: storage.admin,
+            last_accrual_ts: storage.last_accrual_ts,
+            total_interest_earned: storage.total_interest_earned,
+            user_accrued_interest: storage.user_accrued_interest.clone(),
+            total_principal_borrowed: storage.total_principal_borrowed,
         }
     }
 }
@@ -863,6 +877,19 @@ impl LendingService {
                 "Admin treasury withdrawal failed or insufficient balance"
             );
         });
+    }
+
+    pub fn get_contract_state(&self) -> ContractState {
+        ContractState::from(self.get())
+    }
+
+    pub fn handle_action(&mut self, action: crate::io::LendingAction) -> crate::io::LendingReply {
+        match action {
+            crate::io::LendingAction::GetContractState => {
+                crate::io::LendingReply::ContractState(self.get_contract_state())
+            }
+            _ => crate::io::LendingReply::Success, // fallback for other actions
+        }
     }
 }
 

@@ -511,6 +511,7 @@ dependencies = [
  "parity-scale-codec",
  "sails-rs",
  "scale-info",
+ "serde",
 ]
 
 [[package]]
